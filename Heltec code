@@ -1,0 +1,284 @@
+#include <Adafruit_SCD30.h>
+#include <Wire.h> 
+#include <BME280I2C.h>
+#include "LoRaWan_APP.h"
+#include <Tomoto_HM330X.h>
+
+
+
+// LoRaWAN configuration
+#define ACTIVE_REGION LORAMAC_REGION_EU868
+#define SENSOR_PWR_PIN 7  // GPIO pin controlling the transistor for the dust sensor
+#define VBAT_READ_PIN 1   // formerly "VBAT_Read"
+#define ADC_CTRL_PIN  37  // formerly "ADC_Ctrl"
+
+BME280I2C bme;
+Adafruit_SCD30 scd30;
+Tomoto_HM330X sensor;
+
+// LoRaWAN credentials and settings
+//OTAA
+uint8_t devEui[] = { xxxx };
+uint8_t appEui[] = { xxxx };
+uint8_t appKey[] = { xxxxx0 };
+uint16_t userChannelsMask[6] = { 0x00FF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 };
+bool isTxConfirmed = false;
+uint8_t confirmedNbTrials = 4;
+bool overTheAirActivation = true;
+DeviceClass_t loraWanClass = CLASS_A;
+bool loraWanAdr = true;
+//ABP
+uint8_t nwkSKey[] = { xxxxxx0 };
+uint8_t appSKey[] = { xxxx };
+uint32_t devAddr = (uint32_t)0x260BA26D;
+
+uint32_t appTxDutyCycle = 900 * 1000; // Transmit every 15 min
+uint8_t appPort = 2;
+
+unsigned long previousMillis = 0;
+const unsigned long interval = 3000;  // Debug print interval (3 sec)
+float hum1, temperature1;
+float pressure;
+
+// Global variable to store battery capacity percentage (0-100)
+float batteryCapacityPercent = 0.0;
+uint16_t readBatteryVoltage();
+
+void printValue(const char* label, int value, const char* unit) {
+  Serial.print(label);
+  Serial.print(": ");
+  Serial.print(value);
+  Serial.println(unit);
+}
+
+// Prepare the LoRaWAN transmission frame
+static void prepareTxFrame(uint8_t port) {
+  // Read SCD30 values
+  
+  uint16_t temp_scd30 = (uint16_t)(scd30.temperature * 10);
+  uint16_t hum_scd30 = (uint16_t)(scd30.relative_humidity * 10);
+  uint16_t co2_scd30 = (uint16_t)scd30.CO2;
+  uint16_t pres_bme = (uint16_t)pressure;
+
+  // Read dust sensor value (HM330X)
+  // At this point the sensor should be powered on and warmed up.
+ 
+  uint16_t dust_hm = (uint16_t)(sensor.std.getPM10());
+  uint16_t battery = readBatteryVoltage();
+  uint8_t capacity = (uint8_t)batteryCapacityPercent;
+
+  // Construct the payload (10 bytes)
+  appDataSize = 13;
+  appData[0] = (co2_scd30 >> 8) & 0xFF;
+  appData[1] = co2_scd30 & 0xFF;
+  appData[2] = (temp_scd30 >> 8) & 0xFF;
+  appData[3] = temp_scd30 & 0xFF;
+  appData[4] = (hum_scd30 >> 8) & 0xFF;
+  appData[5] = hum_scd30 & 0xFF; 
+  appData[6] = (pres_bme >> 8) & 0xFF; 
+  appData[7] = pres_bme & 0xFF;
+  appData[8] = (dust_hm >> 8) & 0xFF; 
+  appData[9] = dust_hm & 0xFF;
+  appData[10] = (battery >> 8) & 0xFF;
+  appData[11] = battery & 0xFF;
+  appData[12] = capacity;    
+}
+
+void setup() {
+  Serial.begin(115200);
+  // Initialize I2C on custom pins
+  Wire.begin(41, 42);  
+  // Setup the transistor control pin for the sensors and turn it off initially
+  pinMode(SENSOR_PWR_PIN, OUTPUT);
+  digitalWrite(SENSOR_PWR_PIN, HIGH);  // HIGH = sensor off
+
+  // Set ADC resolution to 12 bits (0–4095)
+  analogReadResolution(12);
+  // Configure battery measurement pins:
+  // Set ADC_CTRL_PIN as output and disable battery measurement by default.
+  pinMode(ADC_CTRL_PIN, OUTPUT);
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+  pinMode(VBAT_READ_PIN, INPUT);
+  
+  // NO SENSOR INIT!!!
+  
+  // Initialize LoRaWAN
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  LoRaWAN.init(loraWanClass, ACTIVE_REGION);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Debug prints for continuously powered sensors (BME280 & SCD30 & HM3301)
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+  
+    
+    // For the dust sensor, only attempt a read if it is powered on.
+    if (digitalRead(SENSOR_PWR_PIN) == LOW) {
+      sensor.readSensor();
+      Serial.print("Dust: ");
+      Serial.print(sensor.std.getPM10());
+      Serial.println(" µg/m³");
+      bme.read(pressure, temperature1, hum1, BME280::TempUnit_Celsius, BME280::PresUnit_hPa);
+      scd30.read();
+      Serial.print("CO2: ");
+      Serial.print(scd30.CO2);
+      Serial.println(" ppm");
+      Serial.print("Temperature: ");
+      Serial.print(scd30.temperature);
+      Serial.println(" °C");
+      Serial.print("Relative Humidity: ");
+      Serial.print(scd30.relative_humidity);
+      Serial.println(" %");
+      Serial.print("Pressure: ");
+      Serial.print(pressure);
+      Serial.println(" hPa");
+      
+    
+    } else {
+      Serial.println(" Sensors are off ");
+    }
+    Serial.println();
+  }
+
+  // Handle LoRaWAN state machine
+  switch (deviceState) {
+    case DEVICE_STATE_INIT:
+      LoRaWAN.setDefaultDR(3); // SF 9
+      deviceState = DEVICE_STATE_JOIN;
+      break;
+
+    case DEVICE_STATE_JOIN:
+      Serial.println("Attempting to join LoRaWAN....");
+      LoRaWAN.join();
+      break;
+
+    case DEVICE_STATE_SEND:
+    {
+      // --- Power ON the dust sensor ---
+      digitalWrite(SENSOR_PWR_PIN, LOW);  // Turn on: LOW enables the transistor
+      // Allow time for the sensor to stabilize (adjust delay as needed)
+      Serial.println(" Sensors powering on for transmission...");
+      delay(60000);
+      // Reinitialize the dust sensor after powering on
+      sensor.begin();
+      bme.begin();
+      scd30.begin();
+
+      delay(3000);
+
+      sensor.readSensor();
+      uint16_t dustValue = sensor.std.getPM10();
+      Serial.print("Dust reading before send: ");
+      Serial.print(dustValue);
+      Serial.println(" µg/m³");
+
+      bme.read(pressure, temperature1, hum1, BME280::TempUnit_Celsius, BME280::PresUnit_hPa);
+      uint16_t pres_bme = (uint16_t)pressure;
+      Serial.print("Pressure: ");
+      Serial.print(pressure);
+      Serial.println(" hPa");
+
+      scd30.read();
+      uint16_t temp_scd30 = (uint16_t)(scd30.temperature * 10);
+      uint16_t hum_scd30 = (uint16_t)(scd30.relative_humidity * 10);
+      uint16_t co2_scd30 = (uint16_t)scd30.CO2;
+      uint16_t battery = readBatteryVoltage();
+      Serial.print("CO2: ");
+      Serial.print(scd30.CO2);
+      Serial.println(" ppm");
+      Serial.print("Temperature: ");
+      Serial.print(scd30.temperature);
+      Serial.println(" °C");
+      Serial.print("Relative Humidity: ");
+      Serial.print(scd30.relative_humidity);
+      Serial.println(" %");
+      Serial.print("Battery Voltage: ");
+      Serial.print(battery);
+      Serial.println(" mV");
+      Serial.print("Battery Capacity: ");
+      Serial.print((uint8_t)batteryCapacityPercent);
+      Serial.println(" %");
+
+      // --- Adjust the transmission duty cycle based on battery capacity ---
+      if (batteryCapacityPercent < 30.0) {
+          appTxDutyCycle = 1800 * 1000;  // Set to 30 minutes (600,000 ms)
+          Serial.println("Battery capacity below 30%: Duty cycle set to 10 minutes.");
+      } else if (batteryCapacityPercent > 35.0) {
+          appTxDutyCycle = 900 * 1000;  // Revert to 15 minutes (300,000 ms)
+          Serial.println("Battery capacity above 35%: Duty cycle set to 5 minutes.");
+      }
+      
+      // Prepare and send the transmission frame with sensor readings
+      prepareTxFrame(appPort);
+      LoRaWAN.send();
+
+      // --- Power OFF the dust sensor after successful send ---
+      digitalWrite(SENSOR_PWR_PIN, HIGH);
+      Serial.println(" Sensors powered off after transmission.");
+      
+      deviceState = DEVICE_STATE_CYCLE;
+      break; 
+    }
+
+    case DEVICE_STATE_CYCLE:
+    {   
+      txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
+      LoRaWAN.cycle(txDutyCycleTime);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+    }
+    case DEVICE_STATE_SLEEP:
+      LoRaWAN.sleep(CLASS_A);
+      break;
+
+    default:
+      deviceState = DEVICE_STATE_INIT;
+      break;
+  }
+}
+
+// --------------------------------------------------------------------
+// Function to Read Battery Voltage (in mV) Using Heltec Calibration
+// --------------------------------------------------------------------
+uint16_t readBatteryVoltage() {
+  // ADC resolution and voltage conversion factors
+  const int resolution = 12;
+  const int adcMax = (int)pow(2, resolution) - 1; // 4095 for 12-bit ADC
+  const float adcMaxVoltage = 3.3;
+
+  // On-board voltage divider resistor values
+  const int R1 = 390;
+  const int R2 = 100;
+
+  // Calibration measurements from the example
+  const float measuredVoltage = 4.2;
+  const float reportedVoltage = 4.095;
+
+  // Calculate conversion factor:
+  //   factor = (adcMaxVoltage / adcMax) * ((R1+R2)/R2) * (measuredVoltage / reportedVoltage)
+  const float factor = (adcMaxVoltage / adcMax) *
+                       ((R1 + R2) / (float)R2) *
+                       (measuredVoltage / reportedVoltage);
+
+  // Enable battery measurement: pull ADC_CTRL_PIN LOW.
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  delay(100);  // allow the voltage to stabilize
+  int analogValue = analogRead(VBAT_READ_PIN);
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+
+  // Calculate the battery voltage in volts then convert to millivolts.
+  float floatVoltage = factor * analogValue;
+  uint16_t voltage = (uint16_t)(floatVoltage * 1000.0);
+
+  // Optionally, compute battery capacity as a percentage (for debugging)
+  float batteryPercentage = (floatVoltage - 2.5) / (4.2 - 3.0) * 100.0;
+  if (batteryPercentage < 0) batteryPercentage = 0;
+  if (batteryPercentage > 100) batteryPercentage = 100;
+  batteryCapacityPercent = batteryPercentage;
+  
+  return voltage;
+}
